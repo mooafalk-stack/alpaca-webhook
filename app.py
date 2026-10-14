@@ -285,30 +285,31 @@ def _v(x):
 
 def build_report():
     now = datetime.now(TZ)
-    start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    since = now - timedelta(hours=24)   # senaste 24 h, så att USA-eftermiddagen efter förra rapporten kommer med
     acc = trading.get_account()
     eq, last_eq = float(acc.equity), float(acc.last_equity)
     day_pl, day_pct = eq - last_eq, (eq / last_eq - 1) * 100 if last_eq else 0
     tot_pl, tot_pct = eq - START_EQUITY, (eq / START_EQUITY - 1) * 100
 
     orders = trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.CLOSED,
-                                                 after=start_today.astimezone(timezone.utc), limit=100))
+                                                 after=since.astimezone(timezone.utc), limit=100))
     fills = []
     for o in orders:
         if o.filled_at is None:
             continue
-        fills.append({"time": o.filled_at.astimezone(TZ).strftime("%H:%M"), "symbol": o.symbol,
+        fills.append({"time": o.filled_at.astimezone(TZ).strftime("%d/%m %H:%M"), "symbol": o.symbol,
                       "side": "KÖP" if _v(o.side) == "buy" else "SÄLJ", "qty": o.filled_qty,
-                      "price": float(o.filled_avg_price or 0)})
-    fills.sort(key=lambda f: f["time"])
+                      "price": float(o.filled_avg_price or 0), "ts": o.filled_at})
+    fills.sort(key=lambda f: f["ts"])
 
     positions = [{"symbol": p.symbol, "side": "LONG" if "long" in _v(p.side) else "SHORT", "qty": p.qty,
                   "entry": float(p.avg_entry_price), "pl": float(p.unrealized_pl),
                   "pl_pct": float(p.unrealized_plpc) * 100} for p in trading.get_all_positions()]
 
     today_str = now.strftime("%Y-%m-%d")
-    events = [l for l in event_log if l.startswith(datetime.now(timezone.utc).strftime("%Y-%m-%d"))
-              and any(k in l for k in ("SIGNAL", "ORDER", "CLOSE", "FEL"))]
+    cutoff = since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    events = [l for l in event_log if l[:19] >= cutoff
+              and any(k in l for k in ("SIGNAL", "ORDER", "CLOSE", "SKIP", "FEL"))]
     errors = [l for l in events if "FEL" in l]
 
     sign = lambda x: f"+{x:,.2f}" if x >= 0 else f"{x:,.2f}"
@@ -349,9 +350,9 @@ def build_report():
         + sign(tot_pl) + " USD (" + sign(tot_pct) + " %)</b></td></tr>"
         "<tr><td style='padding:2px 12px 2px 0'>Kontovärde</td><td>" + "{:,.2f}".format(eq) + " USD</td></tr>"
         "</table>"
-        "<h3>Affärer idag (" + str(len(fills)) + ")</h3>" + fills_html
+        "<h3>Affärer senaste 24 h (" + str(len(fills)) + ")</h3>" + fills_html
         + "<h3>Öppna positioner (" + str(len(positions)) + ")</h3>" + pos_html
-        + "<h3>Signaler och händelser idag (" + str(len(events)) + ")</h3>" + events_html
+        + "<h3>Signaler och händelser senaste 24 h (" + str(len(events)) + ")</h3>" + events_html
         + status_html + "</div>"
     )
     return {"subject": subject, "html": html, "day_pl": round(day_pl, 2), "total_pct": round(tot_pct, 2),
