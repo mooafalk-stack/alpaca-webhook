@@ -149,7 +149,9 @@ def go_to_target(target, order_symbol, pos_symbol, is_crypto, qty_alert):
         return
     if side != "flat":
         close(pos_symbol)
-        if not wait_until_flat(pos_symbol):
+        if target == "flat":
+            return                                  # bara stänga, ingen ny order behövs
+        if not wait_until_flat(pos_symbol, timeout=20.0):
             log(f"FEL {pos_symbol}: positionen stängdes inte i tid, avbryter")
             return
     if target == "flat":
