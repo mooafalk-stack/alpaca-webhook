@@ -40,6 +40,11 @@ SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 POSITION_PCT = float(os.environ.get("POSITION_PCT", "5") or 0)   # 0 = använd qty från alerten
 START_EQUITY = float(os.environ.get("START_EQUITY", "100000") or 100000)
+# Simulerat konto: handla som om kontot vore SIM_START USD (t.ex. 2000 ≈ 20 000 kr).
+# SIM_BASE = Alpacas verkliga kontovärde när simuleringen startade.
+SIM_START = float(os.environ.get("SIM_START", "0") or 0)
+SIM_BASE = float(os.environ.get("SIM_BASE", "0") or 0)
+STOCK_SHORTS = os.environ.get("STOCK_SHORTS", "0") == "1"   # 0 = bara long på aktier
 TZ = ZoneInfo("Europe/Stockholm")
 
 trading = TradingClient(API_KEY, SECRET_KEY, paper=True) if API_KEY and SECRET_KEY else None
@@ -108,9 +113,16 @@ def latest_price(order_symbol, is_crypto):
     return float(r[order_symbol].price)
 
 
-def order_qty(order_symbol, is_crypto, qty_from_alert):
+def sizing_equity(real_equity):
+    """Kontovärdet som positionerna räknas på (simulerat om SIM_START är satt)."""
+    if SIM_START > 0:
+        return max(0.0, SIM_START + (real_equity - SIM_BASE))
+    return real_equity
+
+
+def order_qty(order_symbol, is_crypto, qty_from_alert, fractional=False):
     if POSITION_PCT > 0:
-        equity = float(trading.get_account().equity)
+        equity = sizing_equity(float(trading.get_account().equity))
         price = latest_price(order_symbol, is_crypto)
         raw = equity * POSITION_PCT / 100 / price
     else:
@@ -120,6 +132,8 @@ def order_qty(order_symbol, is_crypto, qty_from_alert):
             raw = 1.0
     if is_crypto:
         return math.floor(raw * 1_000_000) / 1_000_000
+    if fractional:
+        return math.floor(raw * 1000) / 1000          # delaktier (bara long)
     return max(1, int(math.floor(raw)))
 
 
@@ -159,8 +173,12 @@ def go_to_target(target, order_symbol, pos_symbol, is_crypto, qty_alert):
     if target == "short" and is_crypto:
         log(f"SKIP {pos_symbol}: Alpaca tillåter inte short på krypto")
         return
+    if target == "short" and not STOCK_SHORTS:
+        log(f"SKIP {pos_symbol}: bara long på aktier")
+        return
     submit(order_symbol, "buy" if target == "long" else "sell",
-           order_qty(order_symbol, is_crypto, qty_alert), is_crypto)
+           order_qty(order_symbol, is_crypto, qty_alert, fractional=(target == "long" and not is_crypto)),
+           is_crypto)
 
 
 def simple_action(action, order_symbol, pos_symbol, is_crypto, qty_alert):
@@ -176,7 +194,7 @@ def simple_action(action, order_symbol, pos_symbol, is_crypto, qty_alert):
         if side == "short":
             close(pos_symbol)                       # exit short
         elif side == "flat":
-            submit(order_symbol, "buy", order_qty(order_symbol, is_crypto, qty_alert), is_crypto)
+            submit(order_symbol, "buy", order_qty(order_symbol, is_crypto, qty_alert, fractional=not is_crypto), is_crypto)
         else:
             log(f"SKIP {pos_symbol}: redan long")
         return
@@ -186,6 +204,8 @@ def simple_action(action, order_symbol, pos_symbol, is_crypto, qty_alert):
         elif side == "flat":
             if is_crypto:
                 log(f"SKIP {pos_symbol}: Alpaca tillåter inte short på krypto")
+            elif not STOCK_SHORTS:
+                log(f"SKIP {pos_symbol}: bara long på aktier")
             else:
                 submit(order_symbol, "sell", order_qty(order_symbol, is_crypto, qty_alert), is_crypto)
         else:
@@ -289,9 +309,12 @@ def build_report():
     now = datetime.now(TZ)
     since = now - timedelta(hours=24)   # senaste 24 h, så att USA-eftermiddagen efter förra rapporten kommer med
     acc = trading.get_account()
-    eq, last_eq = float(acc.equity), float(acc.last_equity)
-    day_pl, day_pct = eq - last_eq, (eq / last_eq - 1) * 100 if last_eq else 0
-    tot_pl, tot_pct = eq - START_EQUITY, (eq / START_EQUITY - 1) * 100
+    real_eq, last_eq = float(acc.equity), float(acc.last_equity)
+    day_pl = real_eq - last_eq
+    eq = sizing_equity(real_eq)
+    start = SIM_START if SIM_START > 0 else START_EQUITY
+    day_pct = day_pl / (eq - day_pl) * 100 if (eq - day_pl) else 0
+    tot_pl, tot_pct = eq - start, (eq / start - 1) * 100
 
     orders = trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.CLOSED,
                                                  after=since.astimezone(timezone.utc), limit=100))
@@ -344,7 +367,8 @@ def build_report():
     html = (
         "<div style='font-family:Arial,sans-serif;max-width:620px'>"
         "<h2 style='margin-bottom:4px'>Trading-rapport " + today_str + "</h2>"
-        "<p style='margin-top:0;color:#666'>Alpaca paper trading · BTC: EMA Cross 15m · SPY: Casper FCR</p>"
+        "<p style='margin-top:0;color:#666'>Alpaca paper trading · BTC: EMA Cross 15m · SPY: Casper FCR (long)"
+        + (" · simulerat konto " + "{:,.0f}".format(SIM_START) + " USD" if SIM_START > 0 else "") + "</p>"
         "<table style='font-size:15px'>"
         "<tr><td style='padding:2px 12px 2px 0'>Resultat idag</td><td style='color:" + color + "'><b>"
         + sign(day_pl) + " USD (" + sign(day_pct) + " %)</b></td></tr>"
