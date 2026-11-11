@@ -255,8 +255,24 @@ def risk_loop():
         time.sleep(RISK_CHECK_SECONDS)
 
 
-if trading is not None and os.environ.get("RISK_GUARD", "1") == "1":
-    threading.Thread(target=risk_loop, daemon=True).start()
+_risk_thread = {"t": None, "pid": None}
+_risk_lock = threading.Lock()
+
+
+def ensure_risk_guard():
+    """Startar riskvakten i den process som faktiskt svarar (gunicorn kan forka efter import)."""
+    if trading is None or os.environ.get("RISK_GUARD", "1") != "1":
+        return
+    with _risk_lock:
+        t = _risk_thread["t"]
+        if t is None or not t.is_alive() or _risk_thread["pid"] != os.getpid():
+            t = threading.Thread(target=risk_loop, daemon=True)
+            t.start()
+            _risk_thread.update(t=t, pid=os.getpid())
+            log(f"RISK: riskvakten startad (pid {os.getpid()})")
+
+
+ensure_risk_guard()
 
 
 # ---------- Signal-logik ----------
@@ -361,6 +377,11 @@ def authorized(data=None):
     return given == WEBHOOK_SECRET
 
 
+@app.before_request
+def _guard():
+    ensure_risk_guard()
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
@@ -398,7 +419,9 @@ def status():
                   "unrealized_pl": p.unrealized_pl} for p in trading.get_all_positions()]
     return jsonify({"equity": acc.equity, "cash": acc.cash, "positions": positions,
                     "position_pct": POSITION_PCT, "risk": {"halted": risk_state["halted"],
-                    "last_check": risk_state["last_check"]}, "log": list(event_log)[-60:]}), 200
+                    "last_check": risk_state["last_check"], "pid": os.getpid(),
+                    "guard_alive": bool(_risk_thread["t"] and _risk_thread["t"].is_alive())},
+                    "log": list(event_log)[-60:]}), 200
 
 
 @app.route("/test", methods=["GET"])
