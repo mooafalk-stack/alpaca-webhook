@@ -176,9 +176,16 @@ def _today():
     return datetime.now(TZ).strftime("%Y-%m-%d")
 
 
+HALT_FILE = "/tmp/alpaca_halt_{}"
+
+
+def _halted_today():
+    return (risk_state["halted"] and risk_state["day"] == _today()) or os.path.exists(HALT_FILE.format(_today()))
+
+
 def entries_blocked(pos_symbol):
-    """Inga nya positioner när dagens förlustgräns har nåtts."""
-    if risk_state["halted"] and risk_state["day"] == _today():
+    """Inga nya positioner när dagens förlustgräns har nåtts (gäller alla serverprocesser)."""
+    if _halted_today():
         log(f"SKIP {pos_symbol}: handelsstopp, dagens förlustgräns ({MAX_DAILY_LOSS_PCT:g} %) är nådd")
         return True
     return False
@@ -203,6 +210,10 @@ def risk_check():
         day_pct = (real_eq - last_eq) / base * 100
         if day_pct <= -MAX_DAILY_LOSS_PCT:
             risk_state["halted"] = True
+            try:
+                open(HALT_FILE.format(today), "w").close()
+            except OSError:
+                pass
             log(f"RISK: dagens resultat {day_pct:.2f} % <= -{MAX_DAILY_LOSS_PCT:g} %, stänger allt och stoppar nya köp")
             with order_lock:
                 for p in positions:
@@ -257,6 +268,24 @@ def risk_loop():
 
 _risk_thread = {"t": None, "pid": None}
 _risk_lock = threading.Lock()
+_leader = {"fh": None, "pid": None, "tried": 0}
+
+
+def _take_leader_lock():
+    """Bara en process (gunicorn-worker) får köra riskvakten, så att inga order dubbleras."""
+    if _leader["fh"] is not None and _leader["pid"] == os.getpid():
+        return True
+    if time.time() - _leader["tried"] < 60 and _leader["pid"] == os.getpid():
+        return False
+    _leader.update(tried=time.time(), pid=os.getpid(), fh=None)
+    try:
+        import fcntl
+        fh = open("/tmp/alpaca_risk_guard.lock", "w")
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _leader["fh"] = fh
+        return True
+    except (OSError, ImportError):
+        return False
 
 
 def ensure_risk_guard():
@@ -266,13 +295,12 @@ def ensure_risk_guard():
     with _risk_lock:
         t = _risk_thread["t"]
         if t is None or not t.is_alive() or _risk_thread["pid"] != os.getpid():
+            if not _take_leader_lock():
+                return                                 # en annan process kör redan riskvakten
             t = threading.Thread(target=risk_loop, daemon=True)
             t.start()
             _risk_thread.update(t=t, pid=os.getpid())
             log(f"RISK: riskvakten startad (pid {os.getpid()})")
-
-
-ensure_risk_guard()
 
 
 # ---------- Signal-logik ----------
@@ -690,7 +718,7 @@ def build_report():
     risk_html = ("<p style='color:#666;font-size:13px'>Riskregler: stopp -" + "{:g}".format(STOP_PCT_STOCK)
                  + " % aktier, -" + "{:g}".format(STOP_PCT_CRYPTO) + " % krypto, handelsstopp vid -"
                  + "{:g}".format(MAX_DAILY_LOSS_PCT) + " % per dag"
-                 + (" · <b style='color:#cf222e'>HANDELSSTOPP AKTIVT IDAG</b>" if risk_state["halted"] else "")
+                 + (" · <b style='color:#cf222e'>HANDELSSTOPP AKTIVT IDAG</b>" if _halted_today() else "")
                  + "</p>")
     if errors:
         status_html = "<p style='color:#cf222e'><b>Fel idag: " + str(len(errors)) + " - se händelselistan ovan.</b></p>"
