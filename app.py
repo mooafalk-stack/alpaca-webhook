@@ -13,6 +13,12 @@ Miljövariabler på Render:
   ALPACA_API_KEY, ALPACA_SECRET_KEY   (krävs)
   WEBHOOK_SECRET                      (rekommenderas, skyddar webhooken)
   POSITION_PCT                        (valfri, standard 5 = 5 % av kontot per trade, 0 = qty från alerten)
+
+Riskregler (hårdkodade i servern, gäller oavsett vad strategierna säger):
+  STOP_PCT_STOCK      standard 2   -> stäng aktieposition vid -2 %
+  STOP_PCT_CRYPTO     standard 4   -> stäng kryptoposition vid -4 %
+  MAX_DAILY_LOSS_PCT  standard 3   -> vid -3 % på en dag: stäng allt, inga nya köp förrän nästa dag
+  SIM_START_DATE      standard 2026-10-16 (start för journal och jämförelse)
 """
 
 import json
@@ -28,10 +34,13 @@ from flask import Flask, jsonify, request
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
-from alpaca.data.requests import CryptoLatestTradeRequest, StockLatestTradeRequest
+from alpaca.data.requests import (CryptoBarsRequest, CryptoLatestTradeRequest, StockBarsRequest,
+                                  StockLatestTradeRequest)
+from alpaca.data.timeframe import TimeFrame
+from alpaca.common.enums import Sort
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
-from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
+from alpaca.trading.requests import GetOrdersRequest, GetPortfolioHistoryRequest, MarketOrderRequest
 
 app = Flask(__name__)
 
@@ -46,6 +55,11 @@ SIM_START = float(os.environ.get("SIM_START", "0") or 0)
 SIM_BASE = float(os.environ.get("SIM_BASE", "0") or 0)
 STOCK_SHORTS = os.environ.get("STOCK_SHORTS", "0") == "1"   # 0 = bara long på aktier
 TZ = ZoneInfo("Europe/Stockholm")
+STOP_PCT_STOCK = float(os.environ.get("STOP_PCT_STOCK", "2") or 0)
+STOP_PCT_CRYPTO = float(os.environ.get("STOP_PCT_CRYPTO", "4") or 0)
+MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PCT", "3") or 0)
+RISK_CHECK_SECONDS = int(os.environ.get("RISK_CHECK_SECONDS", "30") or 30)
+SIM_START_DATE = os.environ.get("SIM_START_DATE", "2026-10-16")
 
 trading = TradingClient(API_KEY, SECRET_KEY, paper=True) if API_KEY and SECRET_KEY else None
 stock_data = StockHistoricalDataClient(API_KEY, SECRET_KEY) if API_KEY and SECRET_KEY else None
@@ -54,7 +68,8 @@ crypto_data = CryptoHistoricalDataClient(API_KEY, SECRET_KEY) if API_KEY and SEC
 order_lock = threading.Lock()          # en order i taget
 recent_signals = {}                    # skydd mot dubbla alerts
 DEDUPE_SECONDS = 60
-event_log = deque(maxlen=50)           # syns på /status
+event_log = deque(maxlen=200)          # syns på /status
+risk_state = {"day": None, "halted": False, "stop_sent": {}, "last_check": None}
 
 
 def log(msg):
@@ -153,6 +168,89 @@ def close(pos_symbol):
     log(f"CLOSE {pos_symbol}")
 
 
+# ---------- Riskregler (koden handlar, inte strategin eller någon AI) ----------
+
+def _today():
+    return datetime.now(TZ).strftime("%Y-%m-%d")
+
+
+def entries_blocked(pos_symbol):
+    """Inga nya positioner när dagens förlustgräns har nåtts."""
+    if risk_state["halted"] and risk_state["day"] == _today():
+        log(f"SKIP {pos_symbol}: handelsstopp, dagens förlustgräns ({MAX_DAILY_LOSS_PCT:g} %) är nådd")
+        return True
+    return False
+
+
+def risk_check():
+    today = _today()
+    if risk_state["day"] != today:
+        if risk_state["halted"]:
+            log("RISK: nytt handelsdygn, handelsstoppet hävs")
+        risk_state.update(day=today, halted=False)
+    risk_state["last_check"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    acc = trading.get_account()
+    real_eq, last_eq = float(acc.equity), float(acc.last_equity)
+    base = sizing_equity(last_eq)
+    positions = trading.get_all_positions()
+    market_open = None
+
+    # 1) Max daglig förlust: stäng allt och stoppa nya köp resten av dagen
+    if MAX_DAILY_LOSS_PCT > 0 and base > 0 and not risk_state["halted"]:
+        day_pct = (real_eq - last_eq) / base * 100
+        if day_pct <= -MAX_DAILY_LOSS_PCT:
+            risk_state["halted"] = True
+            log(f"RISK: dagens resultat {day_pct:.2f} % <= -{MAX_DAILY_LOSS_PCT:g} %, stänger allt och stoppar nya köp")
+            with order_lock:
+                for p in positions:
+                    risk_state["stop_sent"][p.symbol] = time.time()
+                    try:
+                        close(p.symbol)
+                    except APIError as e:
+                        log(f"FEL RISK stäng {p.symbol}: {e}")
+            return
+
+    # 2) Stopp per position
+    for p in positions:
+        is_crypto = "crypto" in _v(p.asset_class)
+        limit = STOP_PCT_CRYPTO if is_crypto else STOP_PCT_STOCK
+        if limit <= 0:
+            continue
+        plpc = float(p.unrealized_plpc) * 100
+        if plpc > -limit:
+            continue
+        if time.time() - risk_state["stop_sent"].get(p.symbol, 0) < 600:
+            continue                                   # redan skickat, vänta på fill
+        if not is_crypto:
+            if market_open is None:
+                market_open = bool(trading.get_clock().is_open)
+            if not market_open:
+                continue                               # aktier stängs när börsen är öppen
+        log(f"STOPP {p.symbol}: {plpc:.2f} % <= -{limit:g} %, stänger positionen")
+        risk_state["stop_sent"][p.symbol] = time.time()
+        with order_lock:
+            try:
+                close(p.symbol)
+            except APIError as e:
+                log(f"FEL STOPP {p.symbol}: {e}")
+
+
+def risk_loop():
+    time.sleep(10)
+    while True:
+        try:
+            if trading is not None:
+                risk_check()
+        except Exception as e:
+            log(f"FEL riskvakt: {type(e).__name__}: {e}")
+        time.sleep(RISK_CHECK_SECONDS)
+
+
+if trading is not None and os.environ.get("RISK_GUARD", "1") == "1":
+    threading.Thread(target=risk_loop, daemon=True).start()
+
+
 # ---------- Signal-logik ----------
 
 def go_to_target(target, order_symbol, pos_symbol, is_crypto, qty_alert):
@@ -176,6 +274,8 @@ def go_to_target(target, order_symbol, pos_symbol, is_crypto, qty_alert):
     if target == "short" and not STOCK_SHORTS:
         log(f"SKIP {pos_symbol}: bara long på aktier")
         return
+    if entries_blocked(pos_symbol):
+        return
     submit(order_symbol, "buy" if target == "long" else "sell",
            order_qty(order_symbol, is_crypto, qty_alert, fractional=(target == "long" and not is_crypto)),
            is_crypto)
@@ -194,6 +294,8 @@ def simple_action(action, order_symbol, pos_symbol, is_crypto, qty_alert):
         if side == "short":
             close(pos_symbol)                       # exit short
         elif side == "flat":
+            if entries_blocked(pos_symbol):
+                return
             submit(order_symbol, "buy", order_qty(order_symbol, is_crypto, qty_alert, fractional=not is_crypto), is_crypto)
         else:
             log(f"SKIP {pos_symbol}: redan long")
@@ -206,7 +308,7 @@ def simple_action(action, order_symbol, pos_symbol, is_crypto, qty_alert):
                 log(f"SKIP {pos_symbol}: Alpaca tillåter inte short på krypto")
             elif not STOCK_SHORTS:
                 log(f"SKIP {pos_symbol}: bara long på aktier")
-            else:
+            elif not entries_blocked(pos_symbol):
                 submit(order_symbol, "sell", order_qty(order_symbol, is_crypto, qty_alert), is_crypto)
         else:
             log(f"SKIP {pos_symbol}: redan short")
@@ -287,7 +389,8 @@ def status():
     positions = [{"symbol": p.symbol, "side": str(p.side), "qty": p.qty,
                   "unrealized_pl": p.unrealized_pl} for p in trading.get_all_positions()]
     return jsonify({"equity": acc.equity, "cash": acc.cash, "positions": positions,
-                    "position_pct": POSITION_PCT, "log": list(event_log)}), 200
+                    "position_pct": POSITION_PCT, "risk": {"halted": risk_state["halted"],
+                    "last_check": risk_state["last_check"]}, "log": list(event_log)[-60:]}), 200
 
 
 @app.route("/test", methods=["GET"])
@@ -303,6 +406,128 @@ def test():
 
 def _v(x):
     return str(x.value if hasattr(x, "value") else x).lower().replace("positionside.", "").replace("orderside.", "")
+
+
+# ---------- Affärsjournal (från Alpacas orderhistorik, överlever omstarter) ----------
+
+def _start_dt():
+    return datetime.strptime(SIM_START_DATE, "%Y-%m-%d").replace(tzinfo=TZ)
+
+
+def fetch_fills(after):
+    fills, cursor, seen = [], after.astimezone(timezone.utc), set()
+    for _ in range(20):
+        batch = trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.CLOSED, after=cursor,
+                                                    limit=500, direction=Sort.ASC))
+        new = [o for o in batch if str(o.id) not in seen]
+        for o in new:
+            seen.add(str(o.id))
+            if o.filled_at is not None and float(o.filled_qty or 0) > 0:
+                fills.append({"symbol": o.symbol.replace("/", ""), "side": _v(o.side),
+                              "qty": float(o.filled_qty), "price": float(o.filled_avg_price or 0),
+                              "time": o.filled_at})
+        if len(batch) < 500 or not new:
+            break
+        cursor = max(o.submitted_at for o in batch)
+    fills.sort(key=lambda f: f["time"])
+    return fills
+
+
+def build_journal():
+    """Räknar ihop avslutade affärer (in -> ut) per symbol. Avgifter ingår inte."""
+    start = _start_dt()
+    fills = fetch_fills(start - timedelta(days=120))   # tidigare fills behövs för att känna inköpspris
+    pos, trades = {}, []
+    for f in fills:
+        s = pos.setdefault(f["symbol"], {"qty": 0.0, "avg": 0.0, "open": None, "cost": 0.0})
+        signed = f["qty"] if f["side"] == "buy" else -f["qty"]
+        if abs(s["qty"]) < 1e-9:                                   # ny position
+            s.update(qty=signed, avg=f["price"], open=f["time"], cost=abs(signed) * f["price"])
+            continue
+        if (s["qty"] > 0) == (signed > 0):                        # ökar positionen
+            tot = s["qty"] + signed
+            s["avg"] = (s["avg"] * abs(s["qty"]) + f["price"] * abs(signed)) / abs(tot)
+            s["cost"] += abs(signed) * f["price"]
+            s["qty"] = tot
+            continue
+        closing = min(abs(signed), abs(s["qty"]))                 # minskar/stänger
+        direction = 1 if s["qty"] > 0 else -1
+        pnl = (f["price"] - s["avg"]) * closing * direction
+        if f["time"] >= start:
+          trades.append({"symbol": f["symbol"], "dir": "LONG" if direction > 0 else "SHORT",
+                       "entry": round(s["avg"], 2), "exit": round(f["price"], 2), "qty": closing,
+                       "pnl": round(pnl, 2), "pct": round((f["price"] / s["avg"] - 1) * 100 * direction, 2),
+                       "opened": s["open"].astimezone(TZ).strftime("%Y-%m-%d %H:%M"),
+                       "closed": f["time"].astimezone(TZ).strftime("%Y-%m-%d %H:%M"),
+                       "hours": round((f["time"] - s["open"]).total_seconds() / 3600, 1)})
+        rest = abs(signed) - closing
+        s["qty"] += signed if rest < 1e-9 else -s["qty"]
+        if rest > 1e-9:                                           # vände riktning
+            s.update(qty=rest * (1 if signed > 0 else -1), avg=f["price"], open=f["time"],
+                     cost=rest * f["price"])
+        elif abs(s["qty"]) < 1e-9:
+            s["qty"] = 0.0
+    wins = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+    gp, gl = sum(t["pnl"] for t in wins), -sum(t["pnl"] for t in losses)
+    stats = {"trades": len(trades), "wins": len(wins), "losses": len(losses),
+             "win_rate": round(len(wins) / len(trades) * 100, 0) if trades else 0,
+             "realized": round(gp - gl, 2), "profit_factor": round(gp / gl, 2) if gl else None,
+             "avg_win": round(gp / len(wins), 2) if wins else 0,
+             "avg_loss": round(-gl / len(losses), 2) if losses else 0}
+    return {"since": SIM_START_DATE, "stats": stats, "trades": trades, "fills": len(fills)}
+
+
+def max_drawdown_pct():
+    """Största nedgång i det simulerade kontovärdet sedan start (dagsdata)."""
+    h = trading.get_portfolio_history(GetPortfolioHistoryRequest(start=_start_dt().astimezone(timezone.utc),
+                                                                 timeframe="1D"))
+    peak, mdd = None, 0.0
+    for e in (h.equity or []):
+        if e is None:
+            continue
+        v = sizing_equity(float(e))
+        peak = v if peak is None or v > peak else peak
+        if peak > 0:
+            mdd = max(mdd, (1 - v / peak) * 100)
+    return round(mdd, 2)
+
+
+def buy_and_hold_pct():
+    """Vad hade hänt om man bara köpt och behållit SPY respektive BTC sedan start?"""
+    out = {}
+    start = _start_dt().astimezone(timezone.utc)
+    try:
+        bars = stock_data.get_stock_bars(StockBarsRequest(symbol_or_symbols="SPY", timeframe=TimeFrame.Day,
+                                                          start=start, end=start + timedelta(days=7),
+                                                          feed=DataFeed.IEX))
+        first = bars["SPY"][0].close
+        out["SPY"] = round((latest_price("SPY", False) / first - 1) * 100, 2)
+    except Exception as e:
+        log(f"FEL jämförelse SPY: {type(e).__name__}: {e}")
+    try:
+        bars = crypto_data.get_crypto_bars(CryptoBarsRequest(symbol_or_symbols="BTC/USD", timeframe=TimeFrame.Day,
+                                                             start=start, end=start + timedelta(days=3)))
+        first = bars["BTC/USD"][0].close
+        out["BTC"] = round((latest_price("BTC/USD", True) / first - 1) * 100, 2)
+    except Exception as e:
+        log(f"FEL jämförelse BTC: {type(e).__name__}: {e}")
+    return out
+
+
+@app.route("/journal", methods=["GET"])
+def journal():
+    if not authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    if trading is None:
+        return jsonify({"error": "API-nycklar saknas"}), 500
+    j = build_journal()
+    j["max_drawdown_pct"] = max_drawdown_pct()
+    j["buy_and_hold_pct"] = buy_and_hold_pct()
+    j["risk"] = {"halted": risk_state["halted"], "last_check": risk_state["last_check"],
+                 "stop_pct_stock": STOP_PCT_STOCK, "stop_pct_crypto": STOP_PCT_CRYPTO,
+                 "max_daily_loss_pct": MAX_DAILY_LOSS_PCT}
+    return jsonify(j), 200
 
 
 def build_report():
@@ -334,7 +559,7 @@ def build_report():
     today_str = now.strftime("%Y-%m-%d")
     cutoff = since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     events = [l for l in event_log if l[:19] >= cutoff
-              and any(k in l for k in ("SIGNAL", "ORDER", "CLOSE", "SKIP", "FEL"))]
+              and any(k in l for k in ("SIGNAL", "ORDER", "CLOSE", "SKIP", "FEL", "STOPP", "RISK"))]
     errors = [l for l in events if "FEL" in l]
 
     sign = lambda x: f"+{x:,.2f}" if x >= 0 else f"{x:,.2f}"
@@ -360,6 +585,46 @@ def build_report():
         events_html = "<pre style='font-size:12px;background:#f6f8fa;padding:8px'>" + chr(10).join(events) + "</pre>"
     else:
         events_html = "<p style='color:#666'>Inga signaler idag.</p>"
+    honest_html = ""
+    try:
+        j = build_journal()
+        st = j["stats"]
+        mdd = max_drawdown_pct()
+        bh = buy_and_hold_pct()
+        pf = "-" if st["profit_factor"] is None else str(st["profit_factor"])
+        cmp_rows = "<tr><td style='padding:2px 12px 2px 0'>Systemet</td><td><b>" + sign(tot_pct) + " %</b></td></tr>"
+        for k in ("SPY", "BTC"):
+            if k in bh:
+                cmp_rows += ("<tr><td style='padding:2px 12px 2px 0'>Bara behålla " + k + "</td><td>"
+                             + sign(bh[k]) + " %</td></tr>")
+        honest_html = (
+            "<h3>Ärligt resultat sedan " + SIM_START_DATE + "</h3>"
+            "<table style='font-size:14px'>"
+            "<tr><td style='padding:2px 12px 2px 0'>Avslutade affärer</td><td>" + str(st["trades"])
+            + " (" + str(st["wins"]) + " vinst, " + str(st["losses"]) + " förlust, "
+            + "{:.0f}".format(st["win_rate"]) + " % träff)</td></tr>"
+            "<tr><td style='padding:2px 12px 2px 0'>Snittvinst / snittförlust</td><td>"
+            + sign(st["avg_win"]) + " / " + sign(st["avg_loss"]) + " USD</td></tr>"
+            "<tr><td style='padding:2px 12px 2px 0'>Profit factor</td><td>" + pf + " (över 1,0 = lönsamt)</td></tr>"
+            "<tr><td style='padding:2px 12px 2px 0'>Största nedgång</td><td>-" + "{:.2f}".format(mdd) + " %</td></tr>"
+            "</table>"
+            "<p style='margin:8px 0 2px'><b>Jämförelse</b></p><table style='font-size:14px'>" + cmp_rows + "</table>"
+        )
+        if now.weekday() == 4:                                   # fredag: veckans obduktion
+            week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
+            lost = [t for t in j["trades"] if t["closed"] >= week_ago and t["pnl"] <= 0]
+            honest_html += ("<h3>Veckans förlustaffärer (" + str(len(lost)) + ")</h3>"
+                            + rows(lost, [("Symbol", lambda t: t["symbol"]), ("In", lambda t: t["opened"]),
+                                          ("Ut", lambda t: t["closed"]), ("Timmar", lambda t: t["hours"]),
+                                          ("Resultat", lambda t: sign(t["pnl"]) + " USD (" + sign(t["pct"]) + " %)")]))
+    except Exception as e:
+        log(f"FEL journal i rapport: {type(e).__name__}: {e}")
+        errors.append("journal")
+    risk_html = ("<p style='color:#666;font-size:13px'>Riskregler: stopp -" + "{:g}".format(STOP_PCT_STOCK)
+                 + " % aktier, -" + "{:g}".format(STOP_PCT_CRYPTO) + " % krypto, handelsstopp vid -"
+                 + "{:g}".format(MAX_DAILY_LOSS_PCT) + " % per dag"
+                 + (" · <b style='color:#cf222e'>HANDELSSTOPP AKTIVT IDAG</b>" if risk_state["halted"] else "")
+                 + "</p>")
     if errors:
         status_html = "<p style='color:#cf222e'><b>Fel idag: " + str(len(errors)) + " - se händelselistan ovan.</b></p>"
     else:
@@ -378,8 +643,9 @@ def build_report():
         "</table>"
         "<h3>Affärer senaste 24 h (" + str(len(fills)) + ")</h3>" + fills_html
         + "<h3>Öppna positioner (" + str(len(positions)) + ")</h3>" + pos_html
+        + honest_html
         + "<h3>Signaler och händelser senaste 24 h (" + str(len(events)) + ")</h3>" + events_html
-        + status_html + "</div>"
+        + status_html + risk_html + "</div>"
     )
     return {"subject": subject, "html": html, "day_pl": round(day_pl, 2), "total_pct": round(tot_pct, 2),
             "fills": len(fills), "positions": len(positions), "errors": len(errors)}
