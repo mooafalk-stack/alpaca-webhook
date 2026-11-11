@@ -451,7 +451,19 @@ def build_journal():
     nästa affär får rätt inköpspris."""
     start = _start_dt()
     fills = fetch_fills(start - timedelta(days=120))   # tidigare fills behövs för att känna inköpspris
+    # Startläge: räkna baklänges från dagens faktiska positioner, så att gamla rester stämmer
+    current = {}
+    for p in trading.get_all_positions():
+        q = abs(float(p.qty)) * (1 if "long" in _v(p.side) else -1)
+        current[p.symbol.replace("/", "")] = q
+    net = {}
+    for f in fills:
+        net[f["symbol"]] = net.get(f["symbol"], 0.0) + (f["qty"] if f["side"] == "buy" else -f["qty"])
     pos, trades = {}, []
+    for sym in set(net) | set(current):
+        init = current.get(sym, 0.0) - net.get(sym, 0.0)
+        if abs(init) > 1e-6 and not (init < 0 and _is_crypto_symbol(sym)):
+            pos[sym] = {"qty": init, "avg": None, "open": None}  # okänt inköpspris (före fönstret)
     for f in fills:
         s = pos.setdefault(f["symbol"], {"qty": 0.0, "avg": 0.0, "open": None})
         signed = f["qty"] if f["side"] == "buy" else -f["qty"]
@@ -462,13 +474,14 @@ def build_journal():
             continue
         if (s["qty"] > 0) == (signed > 0):                        # ökar positionen
             tot = s["qty"] + signed
-            s["avg"] = (s["avg"] * abs(s["qty"]) + f["price"] * abs(signed)) / abs(tot)
+            if s["avg"] is not None:
+                s["avg"] = (s["avg"] * abs(s["qty"]) + f["price"] * abs(signed)) / abs(tot)
             s["qty"] = tot
             continue
         closing = min(abs(signed), abs(s["qty"]))                 # minskar/stänger
         direction = 1 if s["qty"] > 0 else -1
-        pnl = (f["price"] - s["avg"]) * closing * direction
-        if f["time"] >= start:
+        pnl = (f["price"] - s["avg"]) * closing * direction if s["avg"] else 0.0
+        if f["time"] >= start and s["avg"] and s["open"] is not None:
             trades.append({"symbol": f["symbol"], "dir": "LONG" if direction > 0 else "SHORT",
                            "entry": round(s["avg"], 2), "exit": round(f["price"], 2), "qty": closing,
                            "pnl": round(pnl, 2), "pct": round((f["price"] / s["avg"] - 1) * 100 * direction, 2),
@@ -492,9 +505,10 @@ def build_journal():
              "realized": round(gp - gl, 2), "profit_factor": round(gp / gl, 2) if gl else None,
              "avg_win": round(gp / len(wins), 2) if wins else 0,
              "avg_loss": round(-gl / len(losses), 2) if losses else 0}
-    open_pos = {k: {"qty": round(v["qty"], 9), "entry": round(v["avg"], 2),
+    # Öppna positioner = Alpacas faktiska positioner, med inköpspris enligt journalen
+    open_pos = {k: {"qty": round(current[k], 9), "entry": round(v["avg"], 2),
                     "opened": v["open"].astimezone(TZ).strftime("%Y-%m-%d %H:%M")}
-                for k, v in pos.items() if abs(v["qty"]) > 1e-9 and v["open"] is not None}
+                for k, v in pos.items() if k in current and v["open"] is not None and v["avg"]}
     return {"since": SIM_START_DATE, "stats": stats, "trades": trades, "open": open_pos, "fills": len(fills)}
 
 
