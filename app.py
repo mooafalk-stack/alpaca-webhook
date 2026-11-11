@@ -18,7 +18,7 @@ Riskregler (hårdkodade i servern, gäller oavsett vad strategierna säger):
   STOP_PCT_STOCK      standard 2   -> stäng aktieposition vid -2 %
   STOP_PCT_CRYPTO     standard 4   -> stäng kryptoposition vid -4 %
   MAX_DAILY_LOSS_PCT  standard 3   -> vid -3 % på en dag: stäng allt, inga nya köp förrän nästa dag
-  SIM_START_DATE      standard 2026-10-16 (start för journal och jämförelse)
+  SIM_START_DATE      standard 2026-10-17 (start för journal och jämförelse)
 """
 
 import json
@@ -59,7 +59,7 @@ STOP_PCT_STOCK = float(os.environ.get("STOP_PCT_STOCK", "2") or 0)
 STOP_PCT_CRYPTO = float(os.environ.get("STOP_PCT_CRYPTO", "4") or 0)
 MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PCT", "3") or 0)
 RISK_CHECK_SECONDS = int(os.environ.get("RISK_CHECK_SECONDS", "30") or 30)
-SIM_START_DATE = os.environ.get("SIM_START_DATE", "2026-10-16")
+SIM_START_DATE = os.environ.get("SIM_START_DATE", "2026-10-17")
 
 trading = TradingClient(API_KEY, SECRET_KEY, paper=True) if API_KEY and SECRET_KEY else None
 stock_data = StockHistoricalDataClient(API_KEY, SECRET_KEY) if API_KEY and SECRET_KEY else None
@@ -160,11 +160,13 @@ def submit(order_symbol, side, qty, is_crypto):
         time_in_force=TimeInForce.GTC if is_crypto else TimeInForce.DAY,
     )
     o = trading.submit_order(req)
+    _entry_cache["t"] = 0
     log(f"ORDER {side.upper()} {qty} {order_symbol} -> id {o.id} status {o.status}")
 
 
 def close(pos_symbol):
     trading.close_position(pos_symbol)
+    _entry_cache["t"] = 0
     log(f"CLOSE {pos_symbol}")
 
 
@@ -218,6 +220,12 @@ def risk_check():
         if limit <= 0:
             continue
         plpc = float(p.unrealized_plpc) * 100
+        try:
+            j_entry = journal_entries().get(p.symbol.replace("/", ""), {}).get("entry")
+            if j_entry and p.current_price:
+                plpc = (float(p.current_price) / j_entry - 1) * 100 * (1 if "long" in _v(p.side) else -1)
+        except Exception as e:
+            log(f"FEL inköpspris {p.symbol}: {type(e).__name__}: {e}")
         if plpc > -limit:
             continue
         if time.time() - risk_state["stop_sent"].get(p.symbol, 0) < 600:
@@ -433,40 +441,49 @@ def fetch_fills(after):
     return fills
 
 
+def _is_crypto_symbol(sym):
+    return sym.endswith(("USD", "USDT", "USDC")) and len(sym) > 4
+
+
 def build_journal():
-    """Räknar ihop avslutade affärer (in -> ut) per symbol. Avgifter ingår inte."""
+    """Räknar ihop avslutade affärer (in -> ut) per symbol. Avgifter ingår inte.
+    Smårester (avgifter/avrundning, under 2 % av affären) räknas som stängt, så att
+    nästa affär får rätt inköpspris."""
     start = _start_dt()
     fills = fetch_fills(start - timedelta(days=120))   # tidigare fills behövs för att känna inköpspris
     pos, trades = {}, []
     for f in fills:
-        s = pos.setdefault(f["symbol"], {"qty": 0.0, "avg": 0.0, "open": None, "cost": 0.0})
+        s = pos.setdefault(f["symbol"], {"qty": 0.0, "avg": 0.0, "open": None})
         signed = f["qty"] if f["side"] == "buy" else -f["qty"]
         if abs(s["qty"]) < 1e-9:                                   # ny position
-            s.update(qty=signed, avg=f["price"], open=f["time"], cost=abs(signed) * f["price"])
+            if signed < 0 and _is_crypto_symbol(f["symbol"]):
+                continue                                           # krypto kan inte blankas: rest från gammal position
+            s.update(qty=signed, avg=f["price"], open=f["time"])
             continue
         if (s["qty"] > 0) == (signed > 0):                        # ökar positionen
             tot = s["qty"] + signed
             s["avg"] = (s["avg"] * abs(s["qty"]) + f["price"] * abs(signed)) / abs(tot)
-            s["cost"] += abs(signed) * f["price"]
             s["qty"] = tot
             continue
         closing = min(abs(signed), abs(s["qty"]))                 # minskar/stänger
         direction = 1 if s["qty"] > 0 else -1
         pnl = (f["price"] - s["avg"]) * closing * direction
         if f["time"] >= start:
-          trades.append({"symbol": f["symbol"], "dir": "LONG" if direction > 0 else "SHORT",
-                       "entry": round(s["avg"], 2), "exit": round(f["price"], 2), "qty": closing,
-                       "pnl": round(pnl, 2), "pct": round((f["price"] / s["avg"] - 1) * 100 * direction, 2),
-                       "opened": s["open"].astimezone(TZ).strftime("%Y-%m-%d %H:%M"),
-                       "closed": f["time"].astimezone(TZ).strftime("%Y-%m-%d %H:%M"),
-                       "hours": round((f["time"] - s["open"]).total_seconds() / 3600, 1)})
+            trades.append({"symbol": f["symbol"], "dir": "LONG" if direction > 0 else "SHORT",
+                           "entry": round(s["avg"], 2), "exit": round(f["price"], 2), "qty": closing,
+                           "pnl": round(pnl, 2), "pct": round((f["price"] / s["avg"] - 1) * 100 * direction, 2),
+                           "opened": s["open"].astimezone(TZ).strftime("%Y-%m-%d %H:%M"),
+                           "closed": f["time"].astimezone(TZ).strftime("%Y-%m-%d %H:%M"),
+                           "hours": round((f["time"] - s["open"]).total_seconds() / 3600, 1)})
+        dust = max(1e-6, 0.02 * closing)
         rest = abs(signed) - closing
-        s["qty"] += signed if rest < 1e-9 else -s["qty"]
-        if rest > 1e-9:                                           # vände riktning
-            s.update(qty=rest * (1 if signed > 0 else -1), avg=f["price"], open=f["time"],
-                     cost=rest * f["price"])
-        elif abs(s["qty"]) < 1e-9:
-            s["qty"] = 0.0
+        remaining = s["qty"] + direction * -closing
+        if rest > dust and not _is_crypto_symbol(f["symbol"]):     # vände riktning (bara aktier)
+            s.update(qty=rest * (1 if signed > 0 else -1), avg=f["price"], open=f["time"])
+        elif abs(remaining) <= dust:
+            s.update(qty=0.0, avg=0.0, open=None)
+        else:
+            s["qty"] = remaining
     wins = [t for t in trades if t["pnl"] > 0]
     losses = [t for t in trades if t["pnl"] <= 0]
     gp, gl = sum(t["pnl"] for t in wins), -sum(t["pnl"] for t in losses)
@@ -475,7 +492,20 @@ def build_journal():
              "realized": round(gp - gl, 2), "profit_factor": round(gp / gl, 2) if gl else None,
              "avg_win": round(gp / len(wins), 2) if wins else 0,
              "avg_loss": round(-gl / len(losses), 2) if losses else 0}
-    return {"since": SIM_START_DATE, "stats": stats, "trades": trades, "fills": len(fills)}
+    open_pos = {k: {"qty": round(v["qty"], 9), "entry": round(v["avg"], 2),
+                    "opened": v["open"].astimezone(TZ).strftime("%Y-%m-%d %H:%M")}
+                for k, v in pos.items() if abs(v["qty"]) > 1e-9 and v["open"] is not None}
+    return {"since": SIM_START_DATE, "stats": stats, "trades": trades, "open": open_pos, "fills": len(fills)}
+
+
+_entry_cache = {"t": 0, "open": {}}
+
+
+def journal_entries(force=False):
+    """Inköpspris per öppen position enligt orderhistoriken (cache 10 min)."""
+    if force or time.time() - _entry_cache["t"] > 600:
+        _entry_cache.update(t=time.time(), open=build_journal()["open"])
+    return _entry_cache["open"]
 
 
 def max_drawdown_pct():
