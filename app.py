@@ -19,6 +19,14 @@ Riskregler (hårdkodade i servern, gäller oavsett vad strategierna säger):
   STOP_PCT_CRYPTO     standard 4   -> stäng kryptoposition vid -4 %
   MAX_DAILY_LOSS_PCT  standard 3   -> vid -3 % på en dag: stäng allt, inga nya köp förrän nästa dag
   SIM_START_DATE      standard 2026-10-17 (start för journal och jämförelse)
+
+Spärrar före varje ny order (bara inträden, aldrig stängningar):
+  MAX_OPEN_POSITIONS  standard 3   -> inga fler samtidiga positioner
+  MAX_ORDER_PCT       standard 10  -> en order får vara högst 10 % av (simulerade) kontot
+  PRICE_BAND_PCT      standard 1   -> senaste pris får avvika högst 1 % från mitten av köp/sälj-kursen
+  MAX_ORDERS_PER_MIN  standard 3   -> högst 3 nya order per minut
+  köpkraft            ordern måste rymmas i kontots köpkraft
+  MACRO_BLOCK_MIN     standard 30  -> inga nya inträden 30 min före till 30 min efter KPI och Fed-besked
 """
 
 import json
@@ -34,8 +42,8 @@ from flask import Flask, jsonify, request
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
-from alpaca.data.requests import (CryptoBarsRequest, CryptoLatestTradeRequest, StockBarsRequest,
-                                  StockLatestTradeRequest)
+from alpaca.data.requests import (CryptoBarsRequest, CryptoLatestQuoteRequest, CryptoLatestTradeRequest,
+                                  StockBarsRequest, StockLatestQuoteRequest, StockLatestTradeRequest)
 from alpaca.data.timeframe import TimeFrame
 from alpaca.common.enums import Sort
 from alpaca.trading.client import TradingClient
@@ -60,6 +68,26 @@ STOP_PCT_CRYPTO = float(os.environ.get("STOP_PCT_CRYPTO", "4") or 0)
 MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PCT", "3") or 0)
 RISK_CHECK_SECONDS = int(os.environ.get("RISK_CHECK_SECONDS", "30") or 30)
 SIM_START_DATE = os.environ.get("SIM_START_DATE", "2026-10-17")
+MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "3") or 0)
+MAX_ORDER_PCT = float(os.environ.get("MAX_ORDER_PCT", "10") or 0)
+PRICE_BAND_PCT = float(os.environ.get("PRICE_BAND_PCT", "1") or 0)
+MAX_ORDERS_PER_MIN = int(os.environ.get("MAX_ORDERS_PER_MIN", "3") or 0)
+MACRO_BLOCK_MIN = int(os.environ.get("MACRO_BLOCK_MIN", "30") or 0)
+NY = ZoneInfo("America/New_York")
+
+# Makrobesked (New York-tid). Källor, hämtade 2026-11-12:
+#   Fed: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm (beslut kl 14:00, 2027 preliminärt)
+#   KPI: https://www.bls.gov/schedule/news_release/cpi.htm (kl 08:30)
+# Uppdatera listan innan sista datumet passeras – rapporten varnar 45 dagar innan.
+MACRO_EVENTS = [(d + " " + t, n) for d, t, n in [
+    ("2026-11-10", "08:30", "KPI"), ("2026-12-09", "14:00", "Fed"), ("2026-12-10", "08:30", "KPI"),
+    ("2027-01-13", "08:30", "KPI"), ("2027-01-27", "14:00", "Fed"), ("2027-02-11", "08:30", "KPI"),
+    ("2027-03-10", "08:30", "KPI"), ("2027-03-17", "14:00", "Fed"), ("2027-04-13", "08:30", "KPI"),
+    ("2027-04-28", "14:00", "Fed"), ("2027-05-12", "08:30", "KPI"), ("2027-06-09", "14:00", "Fed"),
+    ("2027-06-10", "08:30", "KPI"), ("2027-07-14", "08:30", "KPI"), ("2027-07-28", "14:00", "Fed"),
+    ("2027-08-11", "08:30", "KPI"), ("2027-09-14", "08:30", "KPI"), ("2027-09-15", "14:00", "Fed"),
+    ("2027-10-14", "08:30", "KPI"), ("2027-10-27", "14:00", "Fed"), ("2027-11-10", "08:30", "KPI"),
+    ("2027-12-08", "14:00", "Fed"), ("2027-12-10", "08:30", "KPI")]]
 
 trading = TradingClient(API_KEY, SECRET_KEY, paper=True) if API_KEY and SECRET_KEY else None
 stock_data = StockHistoricalDataClient(API_KEY, SECRET_KEY) if API_KEY and SECRET_KEY else None
@@ -153,6 +181,8 @@ def order_qty(order_symbol, is_crypto, qty_from_alert, fractional=False):
 
 
 def submit(order_symbol, side, qty, is_crypto):
+    if not order_gates(order_symbol, side, qty, is_crypto):
+        return
     req = MarketOrderRequest(
         symbol=order_symbol,
         qty=qty,
@@ -160,6 +190,7 @@ def submit(order_symbol, side, qty, is_crypto):
         time_in_force=TimeInForce.GTC if is_crypto else TimeInForce.DAY,
     )
     o = trading.submit_order(req)
+    _note_order()
     _entry_cache["t"] = 0
     log(f"ORDER {side.upper()} {qty} {order_symbol} -> id {o.id} status {o.status}")
 
@@ -183,12 +214,110 @@ def _halted_today():
     return (risk_state["halted"] and risk_state["day"] == _today()) or os.path.exists(HALT_FILE.format(_today()))
 
 
+def macro_event_near(now=None):
+    """Returnerar makrobeskedet om vi är inom MACRO_BLOCK_MIN minuter från det, annars None."""
+    if MACRO_BLOCK_MIN <= 0:
+        return None
+    now = now or datetime.now(timezone.utc)
+    for when, name in MACRO_EVENTS:
+        t = datetime.strptime(when, "%Y-%m-%d %H:%M").replace(tzinfo=NY)
+        if abs((now - t).total_seconds()) <= MACRO_BLOCK_MIN * 60:
+            return f"{name} {when} New York-tid"
+    return None
+
+
+def macro_calendar_days_left():
+    last = datetime.strptime(MACRO_EVENTS[-1][0], "%Y-%m-%d %H:%M").replace(tzinfo=NY)
+    return (last - datetime.now(timezone.utc)).days
+
+
 def entries_blocked(pos_symbol):
-    """Inga nya positioner när dagens förlustgräns har nåtts (gäller alla serverprocesser)."""
+    """Inga nya positioner vid handelsstopp eller runt makrobesked (gäller alla serverprocesser)."""
     if _halted_today():
         log(f"SKIP {pos_symbol}: handelsstopp, dagens förlustgräns ({MAX_DAILY_LOSS_PCT:g} %) är nådd")
         return True
+    ev = macro_event_near()
+    if ev:
+        log(f"SKIP {pos_symbol}: makrobesked ({ev}), inga nya inträden ±{MACRO_BLOCK_MIN} min")
+        return True
     return False
+
+
+ORDER_TS_FILE = "/tmp/alpaca_order_times"
+
+
+def _recent_orders(window=60):
+    try:
+        import fcntl
+        with open(ORDER_TS_FILE, "a+") as fh:
+            fcntl.flock(fh, fcntl.LOCK_SH)
+            fh.seek(0)
+            return [float(x) for x in fh.read().split() if time.time() - float(x) < window]
+    except (OSError, ValueError, ImportError):
+        return []
+
+
+def _note_order():
+    """Lägger till tidsstämpeln under fil-lås, så att flera serverprocesser inte skriver över varandra."""
+    try:
+        import fcntl
+        with open(ORDER_TS_FILE, "a+") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            fh.seek(0)
+            ts = [float(x) for x in fh.read().split() if time.time() - float(x) < 3600] + [time.time()]
+            fh.seek(0)
+            fh.truncate()
+            fh.write(" ".join(f"{x:.3f}" for x in ts))
+    except (OSError, ValueError, ImportError):
+        pass
+
+
+def latest_quote_mid(order_symbol, is_crypto):
+    if is_crypto:
+        q = crypto_data.get_crypto_latest_quote(CryptoLatestQuoteRequest(symbol_or_symbols=order_symbol))
+    else:
+        q = stock_data.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=order_symbol,
+                                                                      feed=DataFeed.IEX))
+    bid, ask = float(q[order_symbol].bid_price or 0), float(q[order_symbol].ask_price or 0)
+    return (bid + ask) / 2 if bid > 0 and ask > 0 else 0.0
+
+
+def order_gates(order_symbol, side, qty, is_crypto):
+    """Spärrar före varje ny order. Stoppar hellre än chansar: okänd data = ingen order."""
+    def stop(why):
+        log(f"SPÄRR {order_symbol}: {why} - ingen order")
+        return False
+    try:
+        if not qty or float(qty) <= 0:
+            return stop("antal är 0")
+        if MAX_ORDERS_PER_MIN > 0 and len(_recent_orders()) >= MAX_ORDERS_PER_MIN:
+            return stop(f"max {MAX_ORDERS_PER_MIN} order per minut")
+        me = order_symbol.replace("/", "")
+        held = {p.symbol.replace("/", "") for p in trading.get_all_positions()}
+        pending = {o.symbol.replace("/", "") for o in trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))}
+        others = (held | pending) - {me}                     # ej fyllda order räknas också
+        if MAX_OPEN_POSITIONS > 0 and len(others) >= MAX_OPEN_POSITIONS:
+            return stop(f"redan {len(others)} öppna positioner/order (max {MAX_OPEN_POSITIONS})")
+        price = latest_price(order_symbol, is_crypto)
+        if PRICE_BAND_PCT > 0:
+            mid = latest_quote_mid(order_symbol, is_crypto)
+            if mid <= 0:
+                return stop("ingen köp/sälj-kurs att kontrollera priset mot")
+            dev = abs(price / mid - 1) * 100
+            if dev > PRICE_BAND_PCT:
+                return stop(f"senaste pris {price:,.2f} avviker {dev:.2f} % från {mid:,.2f} (max {PRICE_BAND_PCT:g} %)")
+        value = float(qty) * price
+        acc = trading.get_account()
+        if MAX_ORDER_PCT > 0:
+            cap = sizing_equity(float(acc.equity)) * MAX_ORDER_PCT / 100
+            if value > cap:
+                return stop(f"ordern {value:,.2f} USD är större än {MAX_ORDER_PCT:g} % av kontot ({cap:,.2f} USD)")
+        bp = float((acc.non_marginable_buying_power if is_crypto else acc.buying_power) or 0)
+        if value > bp:
+            return stop(f"ordern {value:,.2f} USD är större än köpkraften {bp:,.2f} USD")
+        return True
+    except Exception as e:
+        return stop(f"kontrollen misslyckades ({type(e).__name__}: {e})")
 
 
 def risk_check():
@@ -551,7 +680,10 @@ def build_journal():
     wins = [t for t in trades if t["pnl"] > 0]
     losses = [t for t in trades if t["pnl"] <= 0]
     gp, gl = sum(t["pnl"] for t in wins), -sum(t["pnl"] for t in losses)
-    stats = {"trades": len(trades), "wins": len(wins), "losses": len(losses),
+    n = len(trades)
+    stats = {"trades": n, "wins": len(wins), "losses": len(losses),
+             "ev_usd": round((gp - gl) / n, 2) if n else 0,
+             "ev_pct": round(sum(t["pct"] for t in trades) / n, 2) if n else 0,
              "win_rate": round(len(wins) / len(trades) * 100, 0) if trades else 0,
              "realized": round(gp - gl, 2), "profit_factor": round(gp / gl, 2) if gl else None,
              "avg_win": round(gp / len(wins), 2) if wins else 0,
@@ -654,7 +786,7 @@ def build_report():
     today_str = now.strftime("%Y-%m-%d")
     cutoff = since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     events = [l for l in event_log if l[:19] >= cutoff
-              and any(k in l for k in ("SIGNAL", "ORDER", "CLOSE", "SKIP", "FEL", "STOPP", "RISK"))]
+              and any(k in l for k in ("SIGNAL", "ORDER", "CLOSE", "SKIP", "FEL", "STOPP", "RISK", "SPÄRR"))]
     errors = [l for l in events if "FEL" in l]
 
     sign = lambda x: f"+{x:,.2f}" if x >= 0 else f"{x:,.2f}"
@@ -700,6 +832,8 @@ def build_report():
             + "{:.0f}".format(st["win_rate"]) + " % träff)</td></tr>"
             "<tr><td style='padding:2px 12px 2px 0'>Snittvinst / snittförlust</td><td>"
             + sign(st["avg_win"]) + " / " + sign(st["avg_loss"]) + " USD</td></tr>"
+            "<tr><td style='padding:2px 12px 2px 0'>Förväntat värde per affär</td><td><b>"
+            + sign(st["ev_usd"]) + " USD (" + sign(st["ev_pct"]) + " %)</b> (under 0 = förlorar i snitt)</td></tr>"
             "<tr><td style='padding:2px 12px 2px 0'>Profit factor</td><td>" + pf + " (över 1,0 = lönsamt)</td></tr>"
             "<tr><td style='padding:2px 12px 2px 0'>Största nedgång</td><td>-" + "{:.2f}".format(mdd) + " %</td></tr>"
             "</table>"
@@ -719,7 +853,14 @@ def build_report():
                  + " % aktier, -" + "{:g}".format(STOP_PCT_CRYPTO) + " % krypto, handelsstopp vid -"
                  + "{:g}".format(MAX_DAILY_LOSS_PCT) + " % per dag"
                  + (" · <b style='color:#cf222e'>HANDELSSTOPP AKTIVT IDAG</b>" if _halted_today() else "")
+                 + ". Spärrar: max " + str(MAX_OPEN_POSITIONS) + " positioner, max " + "{:g}".format(MAX_ORDER_PCT)
+                 + " % per order, prisband ±" + "{:g}".format(PRICE_BAND_PCT) + " %, max " + str(MAX_ORDERS_PER_MIN)
+                 + " order/min, inga inträden ±" + str(MACRO_BLOCK_MIN) + " min runt KPI/Fed."
                  + "</p>")
+    days_left = macro_calendar_days_left()
+    if days_left < 45:
+        risk_html += ("<p style='color:#cf222e;font-size:13px'><b>Makrokalendern tar slut om " + str(days_left)
+                      + " dagar - lägg in nya KPI- och Fed-datum.</b></p>")
     if errors:
         status_html = "<p style='color:#cf222e'><b>Fel idag: " + str(len(errors)) + " - se händelselistan ovan.</b></p>"
     else:
@@ -758,6 +899,42 @@ def report():
         log(f"FEL i rapport: {type(e).__name__}: {e}")
         return jsonify({"subject": "⚠️ Trading-rapport kunde inte skapas",
                         "html": f"<p>Fel: {type(e).__name__}: {e}</p>", "errors": 1}), 200
+
+
+@app.route("/bars", methods=["GET"])
+def bars():
+    """Bara läsning, för backtest: /bars?key=..&symbol=SPY&tf=1Min&start=2024-01-02&end=2024-02-01
+    Svar: [[unix-tid, open, high, low, close, volym], ...]. Max 45 dagar per anrop för minutdata."""
+    if not authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    if trading is None:
+        return jsonify({"error": "API-nycklar saknas"}), 500
+    try:
+        from alpaca.data.timeframe import TimeFrameUnit
+        tfs = {"1Min": TimeFrame.Minute, "5Min": TimeFrame(5, TimeFrameUnit.Minute),
+               "15Min": TimeFrame(15, TimeFrameUnit.Minute), "1Hour": TimeFrame.Hour, "1Day": TimeFrame.Day}
+        tf = request.args.get("tf", "1Min")
+        if tf not in tfs:
+            return jsonify({"error": "tf måste vara " + ", ".join(tfs)}), 400
+        start = datetime.strptime(request.args["start"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end = datetime.strptime(request.args["end"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if end <= start or (tf in ("1Min", "5Min") and (end - start).days > 45):
+            return jsonify({"error": "ogiltigt datumintervall (max 45 dagar för minutdata)"}), 400
+        order_symbol, _, is_crypto = parse_symbol(request.args.get("symbol", "SPY"))
+        if is_crypto:
+            bs = crypto_data.get_crypto_bars(CryptoBarsRequest(symbol_or_symbols=order_symbol, timeframe=tfs[tf],
+                                                               start=start, end=end))
+        else:
+            bs = stock_data.get_stock_bars(StockBarsRequest(symbol_or_symbols=order_symbol, timeframe=tfs[tf],
+                                                            start=start, end=end, feed=DataFeed.IEX))
+        rows = [[int(b.timestamp.timestamp()), b.open, b.high, b.low, b.close, b.volume]
+                for b in bs.data.get(order_symbol, [])]
+        return jsonify({"symbol": order_symbol, "tf": tf, "feed": "crypto" if is_crypto else "iex",
+                        "n": len(rows), "bars": rows}), 200
+    except KeyError:
+        return jsonify({"error": "start och end krävs (ÅÅÅÅ-MM-DD)"}), 400
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 
 if __name__ == "__main__":
