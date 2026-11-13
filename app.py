@@ -22,7 +22,7 @@ Riskregler (hårdkodade i servern, gäller oavsett vad strategierna säger):
 
 Spärrar före varje ny order (bara inträden, aldrig stängningar):
   MAX_OPEN_POSITIONS  standard 3   -> inga fler samtidiga positioner
-  MAX_ORDER_PCT       standard 10  -> en order får vara högst 10 % av (simulerade) kontot
+  MAX_ORDER_PCT       standard 1,5 × POSITION_PCT -> en order får vara högst så stor del av (simulerade) kontot
   PRICE_BAND_PCT      standard 1   -> senaste pris får avvika högst 1 % från mitten av köp/sälj-kursen
   MAX_ORDERS_PER_MIN  standard 3   -> högst 3 nya order per minut
   köpkraft            ordern måste rymmas i kontots köpkraft
@@ -69,7 +69,8 @@ MAX_DAILY_LOSS_PCT = float(os.environ.get("MAX_DAILY_LOSS_PCT", "3") or 0)
 RISK_CHECK_SECONDS = int(os.environ.get("RISK_CHECK_SECONDS", "30") or 30)
 SIM_START_DATE = os.environ.get("SIM_START_DATE", "2026-10-17")
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "3") or 0)
-MAX_ORDER_PCT = float(os.environ.get("MAX_ORDER_PCT", "10") or 0)
+# Standard: 1,5 × POSITION_PCT (fångar felräknade order utan att stoppa normala), annars 10 %
+MAX_ORDER_PCT = float(os.environ.get("MAX_ORDER_PCT", "") or (min(100.0, POSITION_PCT * 1.5) if POSITION_PCT > 0 else 10))
 PRICE_BAND_PCT = float(os.environ.get("PRICE_BAND_PCT", "1") or 0)
 MAX_ORDERS_PER_MIN = int(os.environ.get("MAX_ORDERS_PER_MIN", "3") or 0)
 MACRO_BLOCK_MIN = int(os.environ.get("MACRO_BLOCK_MIN", "30") or 0)
